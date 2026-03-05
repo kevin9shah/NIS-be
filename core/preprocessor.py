@@ -6,13 +6,9 @@ Feature engineering pipeline for network traffic data. Handles:
 1. Deduplication
 2. Missing value imputation (median for numeric, mode for categorical)
 3. Outlier clipping via IQR method (1.5× IQR)
-4. Engineered features:
-   - packet_size_ratio: relative packet size vs rolling mean
-   - port_risk_score: risk classification based on destination port
-   - entropy_energy_ratio: spectral entropy / frequency band energy
-   - is_high_freq_burst: binary flag for high-frequency burst traffic
-   - log_inter_arrival: log-transformed inter-arrival time
-5. StandardScaler normalization
+4. Feature normalization with StandardScaler
+
+Supports flexible datasets with any numeric features.
 """
 
 import pandas as pd
@@ -23,18 +19,9 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# The expected columns from the specification
-REQUIRED_FEATURES = [
-    "packet_size",
-    "inter_arrival_time",
-    "src_port",
-    "dst_port",
-    "packet_count_5s",
-    "mean_packet_size",
-    "spectral_entropy",
-    "frequency_band_energy",
-    "protocol_type_TCP",
-]
+# Dataset-agnostic: automatically detect features
+# REQUIRED_FEATURES is now optional - all numeric columns will be used
+REQUIRED_FEATURES = []  # Empty - auto-detect from dataset
 
 # Columns subject to IQR outlier clipping
 IQR_CLIP_COLUMNS = [
@@ -68,7 +55,13 @@ class NetworkPreprocessor:
         self._is_fitted: bool = False
 
     def _validate_columns(self, df: pd.DataFrame) -> List[str]:
-        """Check for missing required columns. Returns list of missing."""
+        """Check if dataset has required columns. Empty list means all numeric columns are OK."""
+        # If REQUIRED_FEATURES is empty, use all numeric columns
+        if not REQUIRED_FEATURES:
+            # Dataset-agnostic mode: use all numeric columns except label
+            return []
+        
+        # Otherwise check for specific features (legacy mode)
         missing = [col for col in REQUIRED_FEATURES if col not in df.columns]
         return missing
 
@@ -121,56 +114,44 @@ class NetworkPreprocessor:
 
     def _engineer_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Create engineered features from raw columns:
-
-        a) packet_size_ratio = packet_size / (mean_packet_size + 1e-6)
-           Captures relative packet size — large ratios indicate abnormal packets.
-
-        b) port_risk_score:
-           - dst_port ∈ {22, 23, 3389, 4444, 6667} → 1.0 (high risk)
-           - dst_port ∈ {80, 443, 53} → 0.0 (low risk)
-           - else → 0.5 (medium risk)
-           Encodes known risky services (SSH, Telnet, RDP, backdoors, IRC).
-
-        c) entropy_energy_ratio = spectral_entropy / (frequency_band_energy + 1e-6)
-           High entropy with low energy can indicate encrypted C2 channels.
-
-        d) is_high_freq_burst = 1 if packet_count_5s > 50 else 0
-           Binary flag for possible DDoS or brute-force burst patterns.
-           Note: if packet_count_5s is normalized (0-1), we use threshold 0.35
-           which corresponds to ~50/140 of the max range.
-
-        e) log_inter_arrival = log1p(inter_arrival_time)
-           Log transform to reduce skewness of timing features.
+        Optionally create engineered features if dataset has the required columns.
+        
+        For datasets like CIC-IDS 2017, this is a no-op since features are already
+        well-designed. For synthetic datasets, this adds domain-specific features.
         """
-        # a) Relative packet size
-        df["packet_size_ratio"] = df["packet_size"] / (df["mean_packet_size"] + 1e-6)
-
-        # b) Port risk classification
-        def _port_risk(port):
-            if port in HIGH_RISK_PORTS:
-                return 1.0
-            elif port in LOW_RISK_PORTS:
-                return 0.0
-            else:
-                return 0.5
-        df["port_risk_score"] = df["dst_port"].apply(_port_risk)
-
-        # c) Entropy-energy ratio
+        # Only try to engineer features if we have the expected columns
+        if "spectral_entropy" not in df.columns or "frequency_band_energy" not in df.columns:
+            # Dataset doesn't have expected columns - skip feature engineering
+            # (already has good features from real network data)
+            logger.info("Skipping feature engineering - dataset has different feature set")
+            return df
+        
+        # Original feature engineering for specific datasets
+        # a) Entropy-energy ratio
         df["entropy_energy_ratio"] = df["spectral_entropy"] / (df["frequency_band_energy"] + 1e-6)
 
-        # d) High-frequency burst detection
-        # Handle both raw counts and normalized values
-        max_count = df["packet_count_5s"].max()
-        if max_count <= 1.0:
-            # Data appears normalized; 50 out of ~140 max ≈ 0.35
-            burst_threshold = 0.35
-        else:
-            burst_threshold = 50
-        df["is_high_freq_burst"] = (df["packet_count_5s"] > burst_threshold).astype(int)
+        # b) High-frequency burst detection
+        if "packet_count_5s" in df.columns:
+            max_count = df["packet_count_5s"].max()
+            if max_count <= 1.0:
+                burst_threshold = 0.35
+            else:
+                burst_threshold = 50
+            df["is_high_freq_burst"] = (df["packet_count_5s"] > burst_threshold).astype(int)
 
-        # e) Log-transformed inter-arrival time
-        df["log_inter_arrival"] = np.log1p(df["inter_arrival_time"])
+        # c) Log-transformed inter-arrival time
+        if "inter_arrival_time" in df.columns:
+            df["log_inter_arrival"] = np.log1p(df["inter_arrival_time"])
+        
+        # d) Packet count anomaly: deviation from mean
+        if "packet_count_5s" in df.columns:
+            mean_pkt_count = df["packet_count_5s"].mean()
+            df["packet_anomaly_score"] = np.abs(df["packet_count_5s"] - mean_pkt_count)
+        
+        # e) Entropy anomaly: deviation from median
+        if "spectral_entropy" in df.columns:
+            median_entropy = df["spectral_entropy"].median()
+            df["entropy_anomaly"] = np.abs(df["spectral_entropy"] - median_entropy)
 
         return df
 
@@ -208,11 +189,19 @@ class NetworkPreprocessor:
             label = df["label"].copy()
             df = df.drop(columns=["label"])
 
-        # Drop extra columns not needed for modeling
-        keep_cols = [c for c in REQUIRED_FEATURES if c in df.columns]
-        extra_cols_in_data = [c for c in df.columns if c not in REQUIRED_FEATURES]
-        if extra_cols_in_data:
-            logger.info(f"Dropping extra columns: {extra_cols_in_data}")
+        # Auto-detect numeric columns if REQUIRED_FEATURES is empty
+        if not REQUIRED_FEATURES:
+            # Use all numeric columns (dataset-agnostic mode)
+            numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+            keep_cols = numeric_cols
+            logger.info(f"Auto-detected {len(keep_cols)} numeric columns")
+        else:
+            # Use specified features (legacy mode for specific datasets)
+            keep_cols = [c for c in REQUIRED_FEATURES if c in df.columns]
+            extra_cols_in_data = [c for c in df.columns if c not in REQUIRED_FEATURES]
+            if extra_cols_in_data:
+                logger.info(f"Dropping extra columns: {extra_cols_in_data}")
+        
         df = df[keep_cols].copy()
 
         # Step 1-3: Clean data
@@ -269,7 +258,15 @@ class NetworkPreprocessor:
             label = df["label"].copy()
             df = df.drop(columns=["label"])
 
-        keep_cols = [c for c in REQUIRED_FEATURES if c in df.columns]
+        # Use same column selection as fit_transform
+        if not REQUIRED_FEATURES:
+            # Auto-detect numeric columns
+            numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+            keep_cols = numeric_cols
+        else:
+            # Use specified features
+            keep_cols = [c for c in REQUIRED_FEATURES if c in df.columns]
+        
         df = df[keep_cols].copy()
 
         df = self._impute_missing(df, fit=False)

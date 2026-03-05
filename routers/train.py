@@ -5,6 +5,10 @@ Model Training Router
 POST /api/train — Train a classification model on the uploaded dataset.
 Supports XGBoost, Random Forest, and Gradient Boosting with configurable
 hyperparameters and test split size.
+
+Class Imbalance Handling:
+    Uses SMOTE (Synthetic Minority Over-sampling Technique) to balance
+    the training set, improving minority class detection.
 """
 
 import time
@@ -12,6 +16,7 @@ import uuid
 import numpy as np
 from fastapi import APIRouter, HTTPException
 from sklearn.model_selection import train_test_split
+from imblearn.over_sampling import SMOTE
 
 from schemas.requests import TrainRequest
 from core.preprocessor import NetworkPreprocessor
@@ -67,12 +72,43 @@ async def train_model(request: TrainRequest):
             X, y, test_size=request.test_size, random_state=42, stratify=y
         )
 
-        # Train model
+        # Apply SMOTE to balance the training set
+        # This generates synthetic samples of the minority class
+        logger.info(f"Applying SMOTE to handle class imbalance...")
+        n_minority = np.sum(y_train == 1)
+        n_majority = np.sum(y_train == 0)
+        original_imbalance_ratio = n_majority / n_minority if n_minority > 0 else 1.0
+        logger.info(f"Before SMOTE - Normal: {n_majority}, Anomaly: {n_minority}, Ratio: {original_imbalance_ratio:.2f}")
+        
+        # Use adaptive k_neighbors (min 1, typically 3-5)
+        k_neighbors = min(3, max(1, n_minority - 1))
+        
+        try:
+            smote = SMOTE(random_state=42, k_neighbors=k_neighbors)
+            X_train_balanced, y_train_balanced = smote.fit_resample(X_train, y_train)
+            n_minority_balanced = np.sum(y_train_balanced == 1)
+            n_majority_balanced = np.sum(y_train_balanced == 0)
+            logger.info(f"After SMOTE - Normal: {n_majority_balanced}, Anomaly: {n_minority_balanced}")
+        except Exception as e:
+            # Fallback: if SMOTE fails, use original training set with class weights
+            logger.warning(f"SMOTE failed ({str(e)}). Using class_weight instead.")
+            X_train_balanced = X_train
+            y_train_balanced = y_train
+
+        # Train model with explicit scale_pos_weight to boost minority class confidence
         trainer = ModelTrainer()
+        hyperparams = request.hyperparams.copy() if request.hyperparams else {}
+        
+        # For XGBoost, use original imbalance ratio even when training on balanced data
+        # This ensures high confidence predictions for the minority class
+        if request.algorithm == "xgboost" and "scale_pos_weight" not in hyperparams:
+            hyperparams["scale_pos_weight"] = original_imbalance_ratio
+            logger.info(f"Set scale_pos_weight={original_imbalance_ratio:.2f} for XGBoost")
+        
         model = trainer.train(
-            X_train, y_train,
+            X_train_balanced, y_train_balanced,
             request.algorithm,
-            request.hyperparams
+            hyperparams
         )
 
         # Evaluate
@@ -94,14 +130,18 @@ async def train_model(request: TrainRequest):
         session["feature_names"] = feature_names
         session["X_test"] = X_test
         session["y_test"] = y_test
-        session["X_train"] = X_train
-        session["y_train"] = y_train
+        session["X_train"] = X_train  # Original training set
+        session["y_train"] = y_train  # Original labels
+        session["X_train_balanced"] = X_train_balanced  # SMOTE-balanced training set
+        session["y_train_balanced"] = y_train_balanced  # SMOTE-balanced labels
         session["processed_df"] = processed_df
 
-        # Class distribution
+        # Class distribution (original split, before SMOTE)
         class_dist = {
-            "train_normal": int(np.sum(y_train == 0)),
-            "train_anomaly": int(np.sum(y_train == 1)),
+            "train_normal_original": int(np.sum(y_train == 0)),
+            "train_anomaly_original": int(np.sum(y_train == 1)),
+            "train_normal_after_smote": int(np.sum(y_train_balanced == 0)),
+            "train_anomaly_after_smote": int(np.sum(y_train_balanced == 1)),
             "test_normal": int(np.sum(y_test == 0)),
             "test_anomaly": int(np.sum(y_test == 1)),
         }

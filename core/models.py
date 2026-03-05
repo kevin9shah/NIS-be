@@ -55,6 +55,7 @@ DEFAULT_HYPERPARAMS = {
         "max_depth": 5,
         "learning_rate": 0.05,
         "subsample": 0.8,
+        "min_samples_leaf": 5,  # Counter class imbalance
     },
 }
 
@@ -87,7 +88,7 @@ class ModelTrainer:
                     defaults[k] = v
 
         if algorithm == "xgboost":
-            # Auto-compute scale_pos_weight for imbalanced classes
+            # Auto-compute scale_pos_weight for imbalanced classes (if not explicitly provided)
             if "scale_pos_weight" not in defaults and y_train is not None:
                 n_neg = int(np.sum(y_train == 0))
                 n_pos = int(np.sum(y_train == 1))
@@ -97,6 +98,8 @@ class ModelTrainer:
         elif algorithm == "random_forest":
             return RandomForestClassifier(**defaults, random_state=42)
         elif algorithm == "gradient_boosting":
+            # Remove scale_pos_weight if present (GradientBoosting doesn't support it)
+            defaults.pop("scale_pos_weight", None)
             return GradientBoostingClassifier(**defaults, random_state=42)
         else:
             raise ValueError(f"Unknown algorithm: {algorithm}. "
