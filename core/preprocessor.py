@@ -97,9 +97,11 @@ class NetworkPreprocessor:
 
     def _clip_outliers(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Clip outliers using IQR method (1.5× IQR).
-        For each target column: values below Q1 - 1.5*IQR or above
-        Q3 + 1.5*IQR are clipped to those bounds.
+        Clip extreme outliers using IQR method (3.0× IQR).
+        Uses a wider fence (3.0× instead of 1.5×) to preserve anomaly signal:
+        anomalies are often extreme values, so aggressive clipping destroys
+        the very features needed for minority-class detection.
+        Only clips the most pathological values (> 3 IQR from quartiles).
         """
         for col in IQR_CLIP_COLUMNS:
             if col not in df.columns:
@@ -107,8 +109,8 @@ class NetworkPreprocessor:
             Q1 = df[col].quantile(0.25)
             Q3 = df[col].quantile(0.75)
             IQR = Q3 - Q1
-            lower = Q1 - 1.5 * IQR
-            upper = Q3 + 1.5 * IQR
+            lower = Q1 - 3.0 * IQR
+            upper = Q3 + 3.0 * IQR
             df[col] = df[col].clip(lower=lower, upper=upper)
         return df
 
@@ -133,25 +135,46 @@ class NetworkPreprocessor:
         # b) High-frequency burst detection
         if "packet_count_5s" in df.columns:
             max_count = df["packet_count_5s"].max()
-            if max_count <= 1.0:
-                burst_threshold = 0.35
-            else:
-                burst_threshold = 50
+            burst_threshold = 0.35 if max_count <= 1.0 else 50
             df["is_high_freq_burst"] = (df["packet_count_5s"] > burst_threshold).astype(int)
 
         # c) Log-transformed inter-arrival time
         if "inter_arrival_time" in df.columns:
             df["log_inter_arrival"] = np.log1p(df["inter_arrival_time"])
-        
+
         # d) Packet count anomaly: deviation from mean
         if "packet_count_5s" in df.columns:
             mean_pkt_count = df["packet_count_5s"].mean()
             df["packet_anomaly_score"] = np.abs(df["packet_count_5s"] - mean_pkt_count)
-        
+
         # e) Entropy anomaly: deviation from median
         if "spectral_entropy" in df.columns:
             median_entropy = df["spectral_entropy"].median()
             df["entropy_anomaly"] = np.abs(df["spectral_entropy"] - median_entropy)
+
+        # --- Interaction features for better class separation ---
+        # Anomalies tend to combine: short inter-arrival + non-standard port + high pack rate
+
+        # f) Burst × port-risk: high packet count to a non-standard port (attack indicator)
+        if "packet_count_5s" in df.columns and "dst_port" in df.columns:
+            # Normalize dst_port to [0,1] range for the product to be meaningful
+            port_norm = df["dst_port"] / (df["dst_port"].max() + 1e-6)
+            df["burst_port_risk"] = df["packet_count_5s"] * (1 - port_norm)  # high pkt + low std port
+
+        # g) Inter-arrival × dst_port: very short IAT to high port numbers = scan/DDoS signature
+        if "inter_arrival_time" in df.columns and "dst_port" in df.columns:
+            port_norm = df["dst_port"] / (df["dst_port"].max() + 1e-6)
+            iat_norm = df["inter_arrival_time"] / (df["inter_arrival_time"].max() + 1e-6)
+            df["iat_port_product"] = (1 - iat_norm) * port_norm  # short IAT + high dst_port
+
+        # h) Packet size × spectral entropy: anomalies often have unusual payload entropy
+        if "packet_size" in df.columns:
+            pkt_norm = df["packet_size"] / (df["packet_size"].max() + 1e-6)
+            df["packet_entropy_product"] = pkt_norm * df["spectral_entropy"]
+
+        # i) Burst × entropy: rapid bursts with unusual entropy = likely attack traffic
+        if "packet_count_5s" in df.columns:
+            df["burst_entropy"] = df["packet_count_5s"] * df["spectral_entropy"]
 
         return df
 
@@ -189,12 +212,17 @@ class NetworkPreprocessor:
             label = df["label"].copy()
             df = df.drop(columns=["label"])
 
-        # Auto-detect numeric columns if REQUIRED_FEATURES is empty
+        # Auto-detect usable columns if REQUIRED_FEATURES is empty.
+        # Include numeric AND boolean columns (booleans are cast to 0/1 int).
+        # Pandas' select_dtypes(np.number) drops bool columns — explicitly
+        # include them here to preserve features like protocol_type_TCP, tcp_flags_SYN.
         if not REQUIRED_FEATURES:
-            # Use all numeric columns (dataset-agnostic mode)
+            bool_cols = df.select_dtypes(include=["bool"]).columns.tolist()
+            if bool_cols:
+                df[bool_cols] = df[bool_cols].astype(int)
             numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
             keep_cols = numeric_cols
-            logger.info(f"Auto-detected {len(keep_cols)} numeric columns")
+            logger.info(f"Auto-detected {len(keep_cols)} columns ({len(bool_cols)} bool→int cast)")
         else:
             # Use specified features (legacy mode for specific datasets)
             keep_cols = [c for c in REQUIRED_FEATURES if c in df.columns]
@@ -258,9 +286,12 @@ class NetworkPreprocessor:
             label = df["label"].copy()
             df = df.drop(columns=["label"])
 
-        # Use same column selection as fit_transform
+        # Use same column selection as fit_transform.
+        # Cast boolean columns to int first so they aren't dropped by select_dtypes.
         if not REQUIRED_FEATURES:
-            # Auto-detect numeric columns
+            bool_cols = df.select_dtypes(include=["bool"]).columns.tolist()
+            if bool_cols:
+                df[bool_cols] = df[bool_cols].astype(int)
             numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
             keep_cols = numeric_cols
         else:

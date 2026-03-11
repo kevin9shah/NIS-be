@@ -71,8 +71,11 @@ async def predict(request: PredictRequest):
         raise HTTPException(status_code=422, detail="No test data available. Train a model first.")
 
     # QTTA parameters
+    # Use the F1-optimal threshold found during training as default base_threshold.
+    # This replaces the hardcoded 0.5, which is too high for imbalanced datasets.
     qtta_params = request.qtta_params or {}
-    base_threshold = qtta_params.get("base_threshold", 0.5)
+    session_optimal = session.get("optimal_threshold", 0.5)
+    base_threshold = qtta_params.get("base_threshold", session_optimal)
     alpha = qtta_params.get("alpha", 0.3)
     d = qtta_params.get("d", 1.0)
 

@@ -38,21 +38,25 @@ logger = logging.getLogger(__name__)
 # Default hyperparameters for each algorithm
 DEFAULT_HYPERPARAMS = {
     "xgboost": {
-        "n_estimators": 200,
-        "max_depth": 6,
+        "n_estimators": 150,
+        "max_depth": 4,           # Reduced: prevents majority-class overfit
         "learning_rate": 0.1,
         "subsample": 0.8,
+        "min_child_weight": 5,    # Prevents splits on tiny minority-class nodes
+        "gamma": 0.2,             # Minimum loss reduction for a split (regularization)
+        "colsample_bytree": 0.7,  # Feature subsampling per tree for robustness
         "eval_metric": "logloss",
     },
     "random_forest": {
         "n_estimators": 200,
         "max_depth": 10,
         "min_samples_split": 5,
+        "min_samples_leaf": 4,    # Reduces tendency to memorize majority class
         "class_weight": "balanced",
     },
     "gradient_boosting": {
         "n_estimators": 150,
-        "max_depth": 5,
+        "max_depth": 4,
         "learning_rate": 0.05,
         "subsample": 0.8,
         "min_samples_leaf": 5,  # Counter class imbalance
