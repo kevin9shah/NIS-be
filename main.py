@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
-from routers import upload, train, predict, stream
+from routers import upload, train, predict, stream, explain, simulate
 
 # ---- Logging ----
 logging.basicConfig(
@@ -63,12 +63,16 @@ upload.set_sessions(SESSIONS)
 train.set_sessions(SESSIONS)
 predict.set_sessions(SESSIONS)
 stream.set_sessions(SESSIONS)
+explain.set_sessions(SESSIONS)
+simulate.set_sessions(SESSIONS)
 
 # ---- Include Routers ----
 app.include_router(upload.router)
 app.include_router(train.router)
 app.include_router(predict.router)
 app.include_router(stream.router)
+app.include_router(explain.router)
+app.include_router(simulate.router)
 
 
 @app.get("/")
