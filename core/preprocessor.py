@@ -49,7 +49,11 @@ class NetworkPreprocessor:
 
     def __init__(self):
         self.scaler: Optional[StandardScaler] = None
-        self.feature_names: List[str] = []
+        self.use_pca: bool = True
+        self.pca_components: int = 8
+        self.pca = None
+        self.original_feature_names: List[str] = []
+        self.final_feature_names: List[str] = []
         self.medians: dict = {}
         self.modes: dict = {}
         self._is_fitted: bool = False
@@ -85,7 +89,8 @@ class NetworkPreprocessor:
                 continue
             if pd.api.types.is_numeric_dtype(df[col]):
                 if fit:
-                    self.medians[col] = float(df[col].median())
+                    med = df[col].median()
+                    self.medians[col] = float(med) if not pd.isna(med) else 0.0
                 fill_val = self.medians.get(col, 0.0)
                 df[col] = df[col].fillna(fill_val)
             else:
@@ -201,6 +206,10 @@ class NetworkPreprocessor:
         """
         df = df.copy()
 
+        # Drop unique identifiers that cause catastrophic XGBoost overfitting
+        useless_ids = ["frame.time", "ip.src_host", "ip.dst_host", "arp.src.hw_mac", "arp.dst.hw_mac"]
+        df = df.drop(columns=[c for c in useless_ids if c in df.columns], errors='ignore')
+
         # Validate required columns exist
         missing = self._validate_columns(df)
         if missing:
@@ -233,18 +242,35 @@ class NetworkPreprocessor:
         df = df[keep_cols].copy()
 
         # Step 1-3: Clean data
-        df = self._drop_duplicates(df)
+        # WARNING: Cannot drop duplicates here because it silently desynchronizes X columns from the external y label array!
+        # df = self._drop_duplicates(df) 
         df = self._impute_missing(df, fit=True)
         df = self._clip_outliers(df)
 
         # Step 4: Feature engineering
         df = self._engineer_features(df)
 
+        # Step 4.5: Global numeric structural sanity bound
+        # Prevent Scikit-Learn variance calculation overflows causing 'RuntimeWarning: overflow encountered in square'
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        df[numeric_cols] = df[numeric_cols].astype(np.float64).clip(lower=-1e15, upper=1e15)
+
         # Step 5: Scale numeric features
-        self.feature_names = list(df.columns)
+        self.original_feature_names = list(df.columns)
         self.scaler = StandardScaler()
-        scaled_values = self.scaler.fit_transform(df[self.feature_names])
-        df_scaled = pd.DataFrame(scaled_values, columns=self.feature_names, index=df.index)
+        scaled_values = self.scaler.fit_transform(df[self.original_feature_names])
+        
+        # Step 6: PCA Reduction (Quantum Readiness)
+        from sklearn.decomposition import PCA
+        if self.use_pca and len(self.original_feature_names) > self.pca_components:
+            self.pca = PCA(n_components=self.pca_components)
+            pca_values = self.pca.fit_transform(scaled_values)
+            self.final_feature_names = [f"PC{i+1}" for i in range(self.pca_components)]
+            df_scaled = pd.DataFrame(pca_values, columns=self.final_feature_names, index=df.index)
+            logger.info(f"Applied PCA: Reduced {len(self.original_feature_names)} features down to {self.pca_components} quantum-ready features.")
+        else:
+            self.final_feature_names = self.original_feature_names
+            df_scaled = pd.DataFrame(scaled_values, columns=self.final_feature_names, index=df.index)
 
         # Re-attach label
         if label is not None:
@@ -254,7 +280,7 @@ class NetworkPreprocessor:
             df_scaled["label"] = label.values[:len(df_scaled)]
 
         self._is_fitted = True
-        return df_scaled, self.feature_names
+        return df_scaled, self.final_feature_names
 
     def transform(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -300,18 +326,28 @@ class NetworkPreprocessor:
         
         df = df[keep_cols].copy()
 
+        # WARNING: Cannot drop duplicates here either to prevent label desynchronization during evaluation.
         df = self._impute_missing(df, fit=False)
         df = self._clip_outliers(df)
         df = self._engineer_features(df)
 
+        # Structural sanity bound for inference
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        df[numeric_cols] = df[numeric_cols].astype(np.float64).clip(lower=-1e15, upper=1e15)
+
         # Ensure same column order as training
-        for col in self.feature_names:
+        for col in self.original_feature_names:
             if col not in df.columns:
                 df[col] = 0
 
-        df = df[self.feature_names]
+        df = df[self.original_feature_names]
         scaled_values = self.scaler.transform(df)
-        df_scaled = pd.DataFrame(scaled_values, columns=self.feature_names, index=df.index)
+        
+        if self.pca is not None:
+            pca_values = self.pca.transform(scaled_values)
+            df_scaled = pd.DataFrame(pca_values, columns=self.final_feature_names, index=df.index)
+        else:
+            df_scaled = pd.DataFrame(scaled_values, columns=self.final_feature_names, index=df.index)
 
         if label is not None:
             df_scaled["label"] = label.values[:len(df_scaled)]

@@ -168,7 +168,10 @@ class QTTAThreshold:
         """
         if len(self.history) < 10:
             return 0.3  # Default noise floor when insufficient history
-        scores = np.array(self.history)
+        # O(N) optimization: Compute baseline noise only over the last 1000 packets
+        # to strictly avoid O(N^2) computational collapse on 240k+ datasets
+        recent_scores = self.history[-1000:]
+        scores = np.array(recent_scores)
         return float(np.clip(np.percentile(scores, 20), 0.05, 0.6))
 
     def update(self, new_score: float) -> Tuple[bool, float, float]:

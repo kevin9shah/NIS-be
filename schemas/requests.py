@@ -18,8 +18,15 @@ class TrainRequest(BaseModel):
     hyperparams: Optional[Dict[str, Any]] = None
 
 
+class LoadDirectoryRequest(BaseModel):
+    """Request body for POST /api/load_directory"""
+    directory_path: str
+    sample_frac: float = Field(default=0.1, gt=0.0, le=1.0)
+
+
 class PredictRequest(BaseModel):
     """Request body for POST /api/predict"""
+    model_config = {"protected_namespaces": ()}
     session_id: str
     model_id: str
     qtta_params: Optional[Dict[str, float]] = Field(
@@ -30,12 +37,14 @@ class PredictRequest(BaseModel):
 
 class ExplainRequest(BaseModel):
     """Request body for POST /api/explain"""
+    model_config = {"protected_namespaces": ()}
     session_id: str
     model_id: str
 
 
 class SimulateRequest(BaseModel):
     """Request body for POST /api/simulate"""
+    model_config = {"protected_namespaces": ()}
     session_id: str
     model_id: str
     vary_packet_count: List[int] = Field(
